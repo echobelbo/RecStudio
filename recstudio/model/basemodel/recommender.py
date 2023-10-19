@@ -210,6 +210,9 @@ class Recommender(torch.nn.Module, abc.ABC):
 
     def _get_callback(self, dataset_name):
         save_dir = self.config['eval']['save_path']
+        if hasattr(self, 'train_stage') and self.train_stage == 'pretrain':
+            return callbacks.IntervalCallback(self, print_logger=self.logger, dataset_name=dataset_name, save_dir=save_dir, \
+                                               interval_epochs=self.config['train']['save_interval_epochs'])
         if self.val_check:
             return callbacks.EarlyStopping(self, self.val_metric, dataset_name, save_dir=save_dir, \
                 patience=self.config['train']['early_stop_patience'], mode=self.config['train']['early_stop_mode'])

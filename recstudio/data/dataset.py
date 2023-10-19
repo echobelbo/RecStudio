@@ -17,6 +17,10 @@ from torch.utils.data.distributed import DistributedSampler
 from sklearn.preprocessing import *
 import ast
 import re
+from transformers import AutoModel, AutoTokenizer
+from transformers.tokenization_utils_base import BatchEncoding
+from datasets import Dataset as TFDataset # transformer dataset 
+from functools import partial
 
 class TripletDataset(Dataset):
     r""" Dataset for Matrix Factorized Methods.
@@ -51,7 +55,8 @@ class TripletDataset(Dataset):
         if cache_flag:
             self.logger.info("Load dataset from cache.")
             self._load_cache(data_dir)
-        else:
+        else:            
+
             self._init_common_field()
             self._load_all_data(data_dir, self.config['field_separator'])
             # first factorize user id and item id, and then filtering to
@@ -61,6 +66,7 @@ class TripletDataset(Dataset):
             self._float_preprocess()
             self._map_all_ids()
             self._post_preprocess()
+
             if self.config['save_cache']:
                 self._save_cache(md5(self.config))
 
@@ -283,6 +289,8 @@ class TripletDataset(Dataset):
             elif ftype == 'float_seq':
                 feat[field] = \
                     feat[field].map(lambda x: np.array([], dtype=np.float64) if isinstance(x, float) else x)
+            elif ftype == 'text':
+                feat[field].fillna(value='', inplace=True)
             else:
                 raise ValueError(f'field type {ftype} is not supported. \
                     Only supports float, token, token_seq, float_seq.')
@@ -290,6 +298,7 @@ class TripletDataset(Dataset):
     def _load_feat(self, feat_path, header, sep, feat_cols, update_dict=True):
         r"""Load the feature from a given a feature file."""
         # fields, types_of_fields = zip(*( _.split(':') for _ in feat_cols))
+        # logger = logging.getLogger('recstudio')
         fields = []
         types_of_fields = []
         seq_seperators = {}
@@ -312,11 +321,11 @@ class TripletDataset(Dataset):
         feat = pd.read_csv(feat_path, sep=sep, header=header, names=fields,
                            dtype=dict(zip(fields, dtype)), engine='python', index_col=False,
                            encoding=self.config['encoding_method'])[list(fields)]
-        # seq_sep = self.config['seq_separator']
+
         for i, (col, t) in enumerate(zip(fields, types_of_fields)):
             if not t.endswith('seq'):
                 if update_dict and (col not in self.field2maxlen):
-                    self.field2maxlen[col] = 1
+                    self.field2maxlen[col] = 1      
                 continue
             feat[col].fillna(value='', inplace=True)
             cast = float if 'float' in t else str
@@ -326,6 +335,75 @@ class TripletDataset(Dataset):
             if update_dict and (col not in self.field2maxlen):
                 self.field2maxlen[col] = feat[col].map(len).max()
         return feat
+    
+    def _text_process(self, word_drop_ratio = -1, col = None, feat = None):
+        r"""Preprocess text fields."""
+        logger = logging.getLogger('recstudio')
+
+        def tokenize_function(examples, col, tokenizer, max_length, plm_model, encode_mode):
+            encoded_sentences = tokenizer(examples[col], 
+                         add_special_tokens=False,
+                        padding=True, 
+                        max_length = max_length, 
+                        truncation=True,
+                        return_attention_mask=False,
+                        return_token_type_ids=False,
+                        return_tensors='pt')
+            outputs = plm_model(**encoded_sentences)
+            if encode_mode == 'cls':
+                feat = outputs.last_hidden_state[:, 0, ].detach().cpu().numpy()
+            elif encode_mode == 'mean':
+                feat = outputs.last_hidden_state.mean(dim=1).detach().cpu().numpy()
+            return {col: feat} 
+                 
+        logger.info(f'Processing text field {col}...')
+        if self.config['text_process_method'] == 'encode':  
+            cache_path = os.path.join(DEFAULT_CACHE_DIR, 'text_cache', md5(self.config))
+            if not os.path.exists(cache_path):
+                os.makedirs(cache_path)
+            if(word_drop_ratio > 0):
+                print(f'Word drop with p={word_drop_ratio}')
+                new_col = col + '_feat_drop'
+                if os.path.exists(os.path.join(cache_path, new_col)):
+                    text_feat={}
+                    text_feat[col] = pd.read_pickle(os.path.join(cache_path, new_col))
+                else:
+                    new_sentence = []
+                    for sentence in feat[col]:
+                        new_sentence.append(' '.join([word for word in sentence.split() if np.random.rand() > word_drop_ratio]))
+                    text_feat= TFDataset.from_pandas(pd.DataFrame(new_sentence, columns=[col]), preserve_index=False)
+                    text_feat = text_feat.map(partial(tokenize_function, col=col, tokenizer=self.tokenizer, max_length=20, plm_model=self.plm_model, encode_mode=self.config['text_encode_mode']),
+                                                                   num_proc=4, batched=True, remove_columns=[col])
+                    
+                    with open(os.path.join(cache_path, new_col), 'wb') as f:
+                        pickle.dump(text_feat[col], f)
+                
+                feat[new_col] = [np.array(lst).astype(np.float32) for lst in text_feat[col]]
+                self.field2type[new_col] = 'text_feat'
+                self.field2maxlen[new_col] = 1
+            else:
+                new_col = col + '_feat'
+                if os.path.exists(os.path.join(cache_path, new_col)):
+                    text_feat={}
+                    text_feat[col] = pd.read_pickle(os.path.join(cache_path, new_col))
+                else:
+                    text_feat = TFDataset.from_pandas(feat[col].to_frame(), preserve_index=False)
+                    text_feat = text_feat.map(partial(tokenize_function, col=col, tokenizer=self.tokenizer, max_length=20, plm_model=self.plm_model, encode_mode=self.config['text_encode_mode']),
+                                                                   num_proc=1, batched=True, remove_columns=[col])
+
+                    with open(os.path.join(cache_path, new_col), 'wb') as f:
+                        pickle.dump(text_feat[col], f)
+
+                feat[new_col] = [np.array(lst).astype(np.float32) for lst in text_feat[col]]
+                self.field2type[new_col] = 'text_feat'
+                self.field2maxlen[new_col] = 1
+        elif self.config['text_process_method'] == 'embedding':
+            pass
+        else:
+            raise ValueError(f'text_process_method {self.config["text_process_method"]} is not supported.')
+        logger.info(f'Processing text field {col} finished.')
+
+
 
     def _get_map_fields(self):
         #fields_share_space = self.config['fields_share_space'] or []
@@ -414,6 +492,7 @@ class TripletDataset(Dataset):
                         feat[float_field] = feat[float_field].astype(str)
                 
 
+   
     def _map_all_ids(self):
         r"""Map tokens to index."""
         fields_share_space = self._get_map_fields()
@@ -480,11 +559,13 @@ class TripletDataset(Dataset):
             return tokens
 
     def _prepare_user_item_feat(self):
+        # logger = logging.getLogger('recstudio')
         if self.user_feat is not None:
             self.user_feat.set_index(self.fuid, inplace=True)
             self.user_feat = self.user_feat.reindex(np.arange(self.num_users))
             self.user_feat.reset_index(inplace=True)
             self._fill_nan(self.user_feat, mapped=True)
+
         elif self.fuid is not None:
             self.user_feat = pd.DataFrame(
                 {self.fuid: np.arange(self.num_users)})
@@ -494,9 +575,20 @@ class TripletDataset(Dataset):
             self.item_feat = self.item_feat.reindex(np.arange(self.num_items))
             self.item_feat.reset_index(inplace=True)
             self._fill_nan(self.item_feat, mapped=True)
+
+
+            
         elif self.fiid is not None:
             self.item_feat = pd.DataFrame(
                 {self.fiid: np.arange(self.num_items)})
+            
+        if self.config['text_process_method'] is not None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config['tokenizer'], use_fast=False)
+            self.plm_model = AutoModel.from_pretrained(self.config['tokenizer'])
+            for feat in self._get_feat_list():
+                for col in feat:
+                    if self.field2type[col] == 'text':   
+                        self._text_process(word_drop_ratio=-1, col=col, feat=feat)
 
     def _post_preprocess(self):
         if self.ftime is not None and self.ftime in self.inter_feat:
@@ -1349,6 +1441,7 @@ class UserDataset(TripletDataset):
                     data = self._get_neg_data(data)
         return data
 
+  
     @property
     def inter_feat_subset(self):
         index = torch.cat([torch.arange(s, e) for s, e in zip(
@@ -1357,7 +1450,7 @@ class UserDataset(TripletDataset):
 
 
 class SeqDataset(TripletDataset):
-    def _init_common_field(self):
+    def _init_common_field(self):      
         super()._init_common_field()
         if self.fuid is None:
             raise ValueError(f"The selected dataset type {self.__class__.__name__} requires `user_id` while got a user-id-free dataset.")
@@ -1581,6 +1674,10 @@ class TensorFrame(Dataset):
             elif ftype == 'token':
                 data[field] = torch.from_numpy(
                     dataframe[field].to_numpy(np.int64))
+            elif ftype == 'text_feat':
+                data[field] = torch.stack([torch.from_numpy(d) for d in value])
+            elif ftype == 'text':
+                data[field] = value
             else:
                 data[field] = torch.from_numpy(
                     dataframe[field].to_numpy(np.float32))

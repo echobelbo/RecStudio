@@ -115,16 +115,12 @@ class BaseRetriever(Recommender):
         return UniformSampler(train_data.num_items)
 
     def _get_item_vector(self):
-        # if self.item_encoder is None:
-        #     assert hasattr(self, 'item_vector') and self.item_vector is not None, \
-        #         'model without item_encoder should have item_vector.'
-        #     return self.item_vector
         if len(self.item_fields) == 1 and isinstance(self.item_encoder, torch.nn.Embedding):
             return self.item_encoder.weight[1:]
         else:
             device = next(self.parameters()).device
             output = [self.item_encoder(self._get_item_feat(self._to_device(batch, device)))
-                      for batch in self.item_feat.loader(batch_size=self.config['train'].get('item_batch_size', 1024))]
+                for batch in self.item_feat.loader(batch_size=self.config['train'].get('item_batch_size', 1024))]
             output = torch.cat(output, dim=0)
             return output[1:]
 
@@ -410,7 +406,7 @@ class BaseRetriever(Recommender):
 
     def test_step(self, batch):
         eval_metric = self.config['eval']['test_metrics']
-        cutoffs = self.config['eval']['cutoff'] if isinstance(self.config['eval']['cutoff'], list) else [self.config['eva']['cutoff']]
+        cutoffs = self.config['eval']['cutoff'] if isinstance(self.config['eval']['cutoff'], list) else [self.config['eval']['cutoff']]
         return self._test_step(batch, eval_metric, cutoffs)
 
     def _test_step(self, batch, metric, cutoffs):
